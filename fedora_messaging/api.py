@@ -1,10 +1,11 @@
 """The API for publishing messages and consuming from message queues."""
 
-import threading
+import crochet
 
-from . import _session, exceptions, config
+from . import exceptions, config
 from .signals import pre_publish_signal, publish_signal, publish_failed_signal
 from .message import Message
+from .twisted.service import FedoraMessagingService
 
 
 __all__ = (
@@ -15,9 +16,6 @@ __all__ = (
     "publish_signal",
     "publish_failed_signal",
 )
-
-# Sessions aren't thread-safe, so each thread gets its own
-_session_cache = threading.local()
 
 
 def consume(callback, bindings=None):
@@ -49,13 +47,27 @@ def consume(callback, bindings=None):
         fedora_messaging.exceptions.HaltConsumer: If the consumer requests that
             it be stopped.
     """
+    crochet.setup()
     if isinstance(bindings, dict):
         bindings = [bindings]
-    session = _session.ConsumerSession()
-    session.consume(callback, bindings)
+
+    service = FedoraMessagingService(callback, bindings=bindings)
+
+    @crochet.run_in_reactor
+    def _sub_wrapper(service):
+        service.startService()
+        return service.getFactory()._halting
+
+    try:
+        result = _sub_wrapper(service)
+        result.wait()
+    except exceptions.HaltConsumer as e:
+        return e.exit_code
+    finally:
+        _stop_service(service)
 
 
-def publish(message, exchange=None):
+def publish(message, exchange=None, timeout=15.0):
     """
     Publish a message to an exchange.
 
@@ -81,6 +93,8 @@ def publish(message, exchange=None):
         message (message.Message): The message to publish.
         exchange (str): The name of the AMQP exchange to publish to; defaults to
             :ref:`conf-publish-exchange`
+        timeout (float): The time in seconds to wait before giving up and raising
+            a :class:`.exceptions.TimeoutError`.
 
     Raises:
         fedora_messaging.exceptions.PublishReturned: Raised if the broker rejects the
@@ -91,18 +105,37 @@ def publish(message, exchange=None):
             fails validation with its JSON schema. This only depends on the
             message you are trying to send, the AMQP server is not involved.
     """
+    crochet.setup()
     pre_publish_signal.send(publish, message=message)
 
     if exchange is None:
         exchange = config.conf["publish_exchange"]
 
-    global _session_cache
-    if not hasattr(_session_cache, "session"):
-        _session_cache.session = _session.PublisherSession()
+    service = FedoraMessagingService(None)
+    _start_service(service)
+
+    @crochet.wait_for(timeout=timeout)
+    def _pub_wrapper(message, exchange=None):
+        return service.getFactory().publish(message, exchange)
 
     try:
-        _session_cache.session.publish(message, exchange=exchange)
+        _pub_wrapper(message, exchange)
         publish_signal.send(publish, message=message)
+    except crochet.TimeoutError as e:
+        publish_failed_signal.send(publish, message=message, reason=e)
+        raise exceptions.ConnectionException(reason=e)
     except exceptions.PublishException as e:
         publish_failed_signal.send(publish, message=message, reason=e)
         raise
+    finally:
+        _stop_service(service)
+
+
+@crochet.run_in_reactor
+def _start_service(service):
+    service.startService()
+
+
+@crochet.run_in_reactor
+def _stop_service(service):
+    service.stopService()

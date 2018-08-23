@@ -114,21 +114,17 @@ class ProtocolTests(unittest.TestCase):
     def test_setup_read(self):
         # Check the setupRead method.
         self.factory.bindings = [
-            {
-                "exchange": "testexchange1",
-                "queue_name": "testqueue1",
-                "routing_key": "#",
-            },
+            {"exchange": "testexchange1", "queue": "testqueue1", "routing_keys": ["#"]},
             {
                 "exchange": "testexchange2",
-                "queue_name": "testqueue2",
+                "queue": "testqueue2",
                 "queue_auto_delete": True,
-                "routing_key": "testrk",
+                "routing_keys": ["testrk"],
             },
             {
                 "exchange": "testexchange3",
-                "queue_name": "testqueue3",
-                "routing_key": "#",
+                "queue": "testqueue3",
+                "routing_keys": ["#"],
                 "queue_arguments": {},
             },
         ]

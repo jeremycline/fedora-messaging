@@ -32,7 +32,6 @@ from twisted.application.internet import TCPClient, SSLClient
 from twisted.internet import ssl
 
 from .. import config
-from .._session import _configure_tls_parameters
 from .factory import FedoraMessagingFactory
 
 
@@ -57,8 +56,6 @@ class FedoraMessagingService(service.MultiService):
         service.MultiService.__init__(self)
         amqp_url = amqp_url or config.conf["amqp_url"]
         self._parameters = pika.URLParameters(amqp_url)
-        if amqp_url.startswith("amqps"):
-            _configure_tls_parameters(self._parameters)
         if self._parameters.client_properties is None:
             self._parameters.client_properties = config.conf["client_properties"]
         self._bindings = bindings or config.conf["bindings"]
@@ -120,8 +117,7 @@ def _ssl_context_factory(parameters):
     with open(config.conf["tls"]["ca_cert"]) as fd:
         ca_cert = ssl.Certificate.loadPEM(fd.read())
     if key and cert:
-        # Note that _configure_tls_parameters sets the auth mode to EXTERNAL
-        # if both key and cert are defined, so we don't need to do that here.
+        parameters.credentials = pika.credentials.ExternalCredentials()
         with open(key) as fd:
             client_keypair = fd.read()
         with open(cert) as fd:

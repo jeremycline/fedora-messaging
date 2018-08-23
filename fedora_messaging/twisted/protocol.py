@@ -77,6 +77,7 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
         self._running = False
         self._queues = set()
         self._message_callback = None
+        self._halted = defer.Deferred()
         self.factory = None
 
     @defer.inlineCallbacks
@@ -112,19 +113,20 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
                 exchange=binding["exchange"], exchange_type="topic", durable=True
             )
             result = yield self._channel.queue_declare(
-                queue=binding["queue_name"],
+                queue=binding["queue"],
                 durable=True,
                 auto_delete=binding.get("queue_auto_delete", False),
                 arguments=binding.get("queue_arguments"),
             )
             queue_name = result.method.queue
-            yield self._channel.queue_bind(
-                queue=queue_name,
-                exchange=binding["exchange"],
-                routing_key=binding["routing_key"],
-            )
+            for routing_key in binding["routing_keys"]:
+                yield self._channel.queue_bind(
+                    queue=queue_name,
+                    exchange=binding["exchange"],
+                    routing_key=routing_key,
+                )
             self._queues.add(queue_name)
-        log.msg("AMQP bindings declared", system=self.name, logLevel=logging.DEBUG)
+        log.msg("AMQP bindings declared", system=self.name, logLevel=logging.INFO)
 
     @defer.inlineCallbacks
     def _read(self, queue_object):
@@ -231,13 +233,14 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
             yield self._channel.basic_nack(
                 delivery_tag=delivery_frame.delivery_tag, requeue=False
             )
-        except HaltConsumer:
+        except HaltConsumer as e:
             log.msg(
                 "Consumer indicated it wishes consumption to halt, " "shutting down",
                 system=self.name,
                 logLevel=logging.WARNING,
             )
             yield self._channel.basic_ack(delivery_tag=delivery_frame.delivery_tag)
+            yield self._halted.callback(e)
             yield self.stopProducing()
         except Exception:
             log.err(

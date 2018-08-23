@@ -52,6 +52,7 @@ class FedoraMessagingFactory(protocol.ReconnectingClientFactory):
         self._message_callback = None
         self.client = None
         self._client_ready = defer.Deferred()
+        self._halting = defer.Deferred()
 
     def startedConnecting(self, connector):
         """Called when the connection to the broker has started.
@@ -145,6 +146,7 @@ class FedoraMessagingFactory(protocol.ReconnectingClientFactory):
         if self.client:
             yield self.client.stopProducing()
         protocol.ReconnectingClientFactory.stopFactory(self)
+        self._halting.callback(None)
 
     @defer.inlineCallbacks
     def consume(self, message_callback):
