@@ -42,7 +42,7 @@ class ConsumeTests(unittest.TestCase):
     def test_bindings_not_list_of_dict(self, mock_session):
         """Assert consume is working(bindings type is not dict)"""
         mock_session.return_value = mock_session
-        self.assertRaises(ValueError, api.consume, "test_callback", "test_bindings")
+        self.assertRaises(TypeError, api.consume, "test_callback", "test_bindings")
 
     def test_bindings_list_of_dict(self, mock_session):
         """Assert consume is working(bindings type is dict)"""

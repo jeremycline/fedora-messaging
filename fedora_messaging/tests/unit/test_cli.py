@@ -291,7 +291,7 @@ class ConsumeCliTests(unittest.TestCase):
         )
         mock_mod_with_callable = mock.Mock(spec=["callable"])
         mock_importlib.import_module.return_value = mock_mod_with_callable
-        mock_consume.side_effect = ValueError(error_message)
+        mock_consume.side_effect = TypeError(error_message)
         result = self.runner.invoke(
             cli.cli, ["consume", "--callback=" + cli_options["callback"]]
         )

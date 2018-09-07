@@ -140,7 +140,7 @@ def consume(exchange, queue_name, routing_key, callback, app_name):
     _log.info("Starting consumer with %s callback", callback_path)
     try:
         return api.consume(callback, bindings)
-    except ValueError as e:
+    except TypeError as e:
         raise click.exceptions.BadOptionUsage(str(e))
     except exceptions.HaltConsumer as e:
         if e.exit_code:

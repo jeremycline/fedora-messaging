@@ -48,7 +48,7 @@ def consume(callback, bindings=None):
     Raises:
         fedora_messaging.exceptions.HaltConsumer: If the consumer requests that
             it be stopped.
-        ValueError: If the consumer provide callback that is not a class that
+        TypeError: If the consumer provide callback that is not a class that
             implements __call__ and is not a function, or if bindings isn't a
             dictionary or list of dictionaries.
     """
@@ -57,7 +57,7 @@ def consume(callback, bindings=None):
     if bindings:
         for b in bindings:
             if not isinstance(b, dict):
-                raise ValueError("Expected list of dict bindings, got {}".format(bindings))
+                raise TypeError("Expected list of dict bindings, got {}".format(bindings))
     session = _session.ConsumerSession()
     session.consume(callback, bindings)
 

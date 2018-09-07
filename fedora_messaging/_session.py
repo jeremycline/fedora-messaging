@@ -480,7 +480,7 @@ class ConsumerSession(object):
 
         Raises:
             HaltConsumer: Raised when the consumer halts.
-            ValueError: If the callback isn't a function or a class with __call__
+            TypeError: If the callback isn't a function or a class with __call__
                 defined.
         """
         self._bindings = bindings or config.conf["bindings"]
@@ -493,7 +493,7 @@ class ConsumerSession(object):
         elif inspect.isfunction(callback):
             self._consumer_callback = callback
         else:
-            raise ValueError(
+            raise TypeError(
                 "Callback must be a class that implements __call__" " or a function."
             )
         self._running = True
