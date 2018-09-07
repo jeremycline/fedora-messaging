@@ -30,8 +30,8 @@ from fedora_messaging.signals import (
 )
 
 
+@mock.patch("fedora_messaging._session.ConsumerSession")
 class ConsumeTests(unittest.TestCase):
-    @mock.patch("fedora_messaging._session.ConsumerSession")
     def test_bindings_are_dict(self, mock_session):
         """Assert consume is working(bindings type is dict)"""
         mock_session.return_value = mock_session
@@ -39,13 +39,19 @@ class ConsumeTests(unittest.TestCase):
         mock_session.assert_called_once()
         mock_session.consume.assert_called_once_with("test_callback", [dict()])
 
-    @mock.patch("fedora_messaging._session.ConsumerSession")
-    def test_bindings_not_dict(self, mock_session):
+    def test_bindings_not_list_of_dict(self, mock_session):
         """Assert consume is working(bindings type is not dict)"""
         mock_session.return_value = mock_session
-        api.consume("test_callback", "test_bindings")
+        self.assertRaises(ValueError, api.consume, "test_callback", "test_bindings")
+
+    def test_bindings_list_of_dict(self, mock_session):
+        """Assert consume is working(bindings type is dict)"""
+        mock_session.return_value = mock_session
+        api.consume("test_callback", [{"example": "binding"}])
         mock_session.assert_called_once()
-        mock_session.consume.assert_called_once_with("test_callback", "test_bindings")
+        mock_session.consume.assert_called_once_with(
+            "test_callback", [{"example": "binding"}]
+        )
 
 
 class PublishTests(unittest.TestCase):
