@@ -44,22 +44,30 @@ class FedoraMessagingService(service.MultiService):
         on_message (callable|None): Callback that will be passed each
             incoming messages. If None, no message consuming is setup.
         amqp_url (str): URL to use for the AMQP server.
-        bindings (list(dict)): A list of dictionaries that define queue
-            bindings to exchanges. This parameter can be used to override the
-            bindings declared in the configuration. See the configuration
-            documentation for details. Each dictionary should contain the
-            following keys: "exchange", "exchange_type", "queue_name",
-            "routing_key", "queue_auto_delete", "queue_arguments", and
-            "binding_arguments" (which are passed to
-            :meth:`pika.channel.Channel.queue_declare` and
-            :meth:`pika.channel.Channel.queue_bind` respectively as the
-            ``arguments`` key.
+        exchanges (list of dicts): List of exchanges to declare at the start of
+            every connection. Each dictionary is passed to
+            :meth:`pika.channel.Channel.exchange_declare` as keyword arguments,
+            so any parameter to that method is a valid key.
+        queues (list of dicts): List of queues to declare at the start of every
+            connection. Each dictionary is passed to
+            :meth:`pika.channel.Channel.queue_declare` as keyword arguments,
+            so any parameter to that method is a valid key.
+        bindings (list of dicts): A list of bindings to be created between
+            queues and exchanges. Each dictionary is passed to
+            :meth:`pika.channel.Channel.queue_bind`. The "queue" and "exchange" keys
+            are required.
+        consumers (dict): A dictionary where each key is a queue name and the value
+            is a callable object to handle messages on that queue. Consumers will be
+            set up after each connection is established so they will survive networking
+            issues.
     """
 
     name = "fedora-messaging"
     factoryClass = FedoraMessagingFactory
 
-    def __init__(self, amqp_url=None, exchanges=None, queues=None, bindings=None):
+    def __init__(
+        self, amqp_url=None, exchanges=None, queues=None, bindings=None, consumers=None
+    ):
         """Initialize the service."""
         service.MultiService.__init__(self)
         amqp_url = amqp_url or config.conf["amqp_url"]
@@ -71,6 +79,12 @@ class FedoraMessagingService(service.MultiService):
         self._exchanges = exchanges or []
         self._queues = queues or []
         self._bindings = bindings or []
+        self.factory = self.factoryClass(
+            self._parameters, exchanges=exchanges, queues=queues, bindings=bindings
+        )
+        consumers = consumers or {}
+        for queue, callback in consumers.items():
+            self.factory.consume(callback, queue)
 
     def startService(self):
         self.connect()
@@ -89,24 +103,20 @@ class FedoraMessagingService(service.MultiService):
         return None
 
     def connect(self):
-        factory = self.factoryClass(
-            self._parameters,
-            exchanges=self._exchanges,
-            queues=self._queues,
-            bindings=self._bindings,
-        )
         if self._parameters.ssl_options:
             serv = SSLClient(
                 host=self._parameters.host,
                 port=self._parameters.port,
-                factory=factory,
+                factory=self.factory,
                 contextFactory=_ssl_context_factory(self._parameters),
             )
         else:
             serv = TCPClient(
-                host=self._parameters.host, port=self._parameters.port, factory=factory
+                host=self._parameters.host,
+                port=self._parameters.port,
+                factory=self.factory,
             )
-        serv.factory = factory
+        serv.factory = self.factory
         name = "{}{}:{}".format(
             "ssl:" if self._parameters.ssl_options else "",
             self._parameters.host,

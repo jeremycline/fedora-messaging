@@ -25,6 +25,7 @@ import mock
 import pika
 
 from fedora_messaging import config
+from fedora_messaging.twisted.factory import FedoraMessagingFactory
 from fedora_messaging.twisted.service import (
     FedoraMessagingService,
     _ssl_context_factory,
@@ -45,6 +46,17 @@ class ServiceTests(unittest.TestCase):
             service._parameters.client_properties, config.conf["client_properties"]
         )
         self.assertEqual(service._queues, [{"queue": "my_queue"}])
+        self.assertIsInstance(service.factory, FedoraMessagingFactory)
+
+    def test_init_with_consumers(self):
+        """Assert consumers are passed onto the factory object."""
+        cb = mock.Mock()
+        with mock.patch("fedora_messaging.twisted.service.FedoraMessagingService.factoryClass"):
+            service = FedoraMessagingService(consumers={"my_queue": cb})
+            FedoraMessagingService.factoryClass.assert_called_once_with(
+                service._parameters, exchanges=None, queues=None, bindings=None
+            )
+            service.factory.consume.assert_called_once_with(cb, "my_queue")
 
     def test_init_client_props_override(self):
         service = FedoraMessagingService("amqp://?client_properties={'foo':'bar'}")
@@ -52,15 +64,11 @@ class ServiceTests(unittest.TestCase):
 
     def test_connect(self):
         service = FedoraMessagingService()
-        factory = mock.Mock()
-        service.factoryClass = mock.Mock(side_effect=lambda *a, **kw: factory)
+        service.factory = mock.Mock()
         service.connect()
-        service.factoryClass.assert_called_once_with(
-            service._parameters, exchanges=[], queues=[], bindings=[]
-        )
         self.assertEqual(len(service.services), 1)
         serv = service.services[0]
-        self.assertTrue(serv.factory is factory)
+        self.assertTrue(serv.factory is service.factory)
         self.assertTrue(serv.parent is service)
 
     def test_startService(self):
