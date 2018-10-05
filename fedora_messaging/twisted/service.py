@@ -25,8 +25,10 @@ See https://twistedmatrix.com/documents/current/core/howto/application.html
 """
 
 from __future__ import absolute_import, unicode_literals
+import locale
 
 import pika
+import six
 from twisted.application import service
 from twisted.application.internet import TCPClient, SSLClient
 from twisted.internet import ssl
@@ -138,7 +140,10 @@ def _ssl_context_factory(parameters):
     client_cert = None
     key = config.conf["tls"]["keyfile"]
     cert = config.conf["tls"]["certfile"]
-    with open(config.conf["tls"]["ca_cert"]) as fd:
+    with open(config.conf["tls"]["ca_cert"], "rb") as fd:
+        # Open it in binary mode since otherwise Twisted will immediately re-encode
+        # it as ASCII, which won't work if the cert bundle has comments that
+        # can't be encoded with ASCII.
         ca_cert = ssl.Certificate.loadPEM(fd.read())
     if key and cert:
         # Note that _configure_tls_parameters sets the auth mode to EXTERNAL
@@ -149,8 +154,14 @@ def _ssl_context_factory(parameters):
             client_keypair += fd.read()
         client_cert = ssl.PrivateCertificate.loadPEM(client_keypair)
 
+    hostname = parameters.host
+    if not isinstance(hostname, six.text_type):
+        # Twisted requires the hostname as decoded text, which it isn't in Python 2
+        # Decode with the system encoding since this came from the config file. Die,
+        # Python 2, die.
+        hostname = hostname.decode(locale.getdefaultlocale()[1])
     context_factory = ssl.optionsForClientTLS(
-        parameters.host,
+        hostname,
         trustRoot=ca_cert,
         clientCertificate=client_cert,
         extraCertificateOptions={"raiseMinimumTo": ssl.TLSVersion.TLSv1_2},
