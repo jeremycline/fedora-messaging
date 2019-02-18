@@ -31,7 +31,7 @@ import pika
 import six
 from twisted.application import service
 from twisted.application.internet import TCPClient, SSLClient
-from twisted.internet import ssl
+from twisted.internet import ssl, defer
 
 from .. import config
 from .._session import _configure_tls_parameters
@@ -84,25 +84,32 @@ class FedoraMessagingService(service.MultiService):
         self.factory = self.factoryClass(
             self._parameters, exchanges=exchanges, queues=queues, bindings=bindings
         )
+        self._consumers = []
         consumers = consumers or {}
         for queue, callback in consumers.items():
-            self.factory.consume(callback, queue)
+            self._consumers.append(self.factory.consume(callback, queue))
 
     def startService(self):
+        # Get hold of the deferred from the protocol, register callback to exit
+        # on raise exception
         self.connect()
         service.MultiService.startService(self)
 
+    @defer.inlineCallbacks
     def stopService(self):
-        factory = self.getFactory()
-        if not factory:
-            return
-        factory.stopTrying()
-        service.MultiService.stopService(self)
+        """
+        Gracefully stop the service.
+
+        Returns:
+            defer.Deferred: a Deferred which is triggered when the service has
+                finished shutting down.
+        """
+        self.factory.stopTrying()
+        yield self.factory.stopFactory()
+        yield service.MultiService.stopService(self)
 
     def getFactory(self):
-        if self.services:
-            return self.services[0].factory
-        return None
+        return self.factory
 
     def connect(self):
         if self._parameters.ssl_options:

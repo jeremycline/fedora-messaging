@@ -2,9 +2,12 @@
 
 import threading
 
+from twisted.internet import ssl, defer, protocol, error, threads, reactor
+
 from . import _session, exceptions, config
 from .signals import pre_publish_signal, publish_signal, publish_failed_signal
 from .message import Message, SEVERITIES  # noqa: F401
+from .twisted import service
 
 
 __all__ = (
@@ -18,6 +21,71 @@ __all__ = (
 
 # Sessions aren't thread-safe, so each thread gets its own
 _session_cache = threading.local()
+_twisted_service = None
+
+
+def twisted_consume(callback, bindings=None, queues=None):
+    """
+    Start a consumer using the provided callback and run it using the Twisted
+    event loop (reactor).
+
+    .. warning:: Callbacks run in a Twisted-managed thread pool to avoid them
+        blocking the event loop. If you wish to use Twisted APIs in your callback
+        you must use the blockingCallFromThread or callFromThread APIs. Note,
+        however that messages are processed serially so there is not speed
+        advantage to this presently.
+
+    This API expects the caller to start the reactor.
+
+    Args:
+        callback (callable): A callable object that accepts one positional argument,
+            a :class:`Message` or a class object that implements the ``__call__``
+            method. The class will be instantiated before use.
+        bindings (dict or list of dict): Bindings to declare before consuming. This
+            should be the same format as the :ref:`conf-bindings` configuration.
+        queue (dict): The queue to declare and consume from. This dictionary should
+            have the "queue", "durable", "auto_delete", "exclusive", and "arguments"
+            keys.
+
+    Returns:
+        List of Deferred:
+            A list of deferred objects that fire with a representation of the
+            consumer when it is successfully registered and running. Note that
+            this API is meant to survive network problems, so consuming will
+            continue until a corresponding call to :func:`twisted_consume_cancel`
+            is called.
+    """
+    global _twisted_service
+    if _twisted_service is None:
+        _twisted_service = service.FedoraMessagingService(config.conf["amqp_url"])
+        reactor.callWhenRunning(_twisted_service.startService)
+        # Twisted is killing the underlying connection before stopService gets
+        # called, so we need to add it as a pre-shutdown event to gracefully
+        # finish up messages in progress.
+        reactor.addSystemEventTrigger("before", "shutdown", _twisted_service.stopService)
+
+    return _twisted_service.factory.consume(callback, bindings, queues)
+
+
+def twisted_consume_cancel(consumer):
+    """
+    Cancel a consumer that was previously started from :func:`.twisted_consume`.
+
+    Consumers that are canceled are allowed to finish processing any messages before
+    halting.
+
+    Args:
+        consumer (dict or Deferred): The consumer to cancel. These consumer
+            objects are returned by the call to :func:`.twsted_consume`.
+
+    Returns:
+        Deferred: A Deferred that fires when the consumer is successfully canceled.
+    """
+    global _twisted_service
+    if _twisted_service is None:
+        raise ValueError("There is no Twisted service running")
+
+    return _twisted_service.cancel(consumer)
 
 
 def consume(callback, bindings=None, queues=None):

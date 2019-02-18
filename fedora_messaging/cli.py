@@ -27,6 +27,8 @@ import logging.config
 import os
 import sys
 
+from twisted.logger import globalLogBeginner, STDLibLogObserver
+from twisted.internet import reactor
 import click
 import pkg_resources
 
@@ -88,6 +90,7 @@ def cli(conf):
 @click.option("--exchange", help=_exchange_help)
 def consume(exchange, queue_name, routing_key, callback, app_name):
     """Consume messages from an AMQP queue using a Python callback."""
+    globalLogBeginner.beginLoggingTo([STDLibLogObserver(name=__name__)])
 
     # The configuration validates these are not null and contain all required keys
     # when it is loaded.
@@ -153,18 +156,16 @@ def consume(exchange, queue_name, routing_key, callback, app_name):
 
     _log.info("Starting consumer with %s callback", callback_path)
     try:
-        return api.consume(callback, bindings=bindings, queues=queues)
+        # TODO Cancel on signal/shutdown
+        #
+        # TODO how to check up on consumers to see if they're still running?
+        # Because of HaltConsumer exception.
+        deferred_consumers = api.twisted_consume(callback, bindings=bindings, queues=queues)
     except ValueError as e:
         click_version = pkg_resources.get_distribution("click").parsed_version
         if click_version < pkg_resources.parse_version("7.0"):
             raise click.exceptions.BadOptionUsage(str(e))
         else:
             raise click.exceptions.BadOptionUsage("callback", str(e))
-    except exceptions.HaltConsumer as e:
-        if e.exit_code:
-            _log.error(
-                "Consumer halted with non-zero exit code (%d): %s",
-                e.exit_code,
-                str(e.reason),
-            )
-            sys.exit(e.exit_code)
+
+    reactor.run()

@@ -1,3 +1,8 @@
+
+# Use the existing protocol, mangled to change the consume API as necessary. Try the endpoints API?
+# present since 10.1, but probably not worth it at the moment
+
+
 # This file is part of fedora_messaging.
 # Copyright (C) 2018 Red Hat, Inc.
 #
@@ -15,32 +20,31 @@
 # with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
 """
-The core Twisted interface, a protocol represent a specific connection to the
-AMQP broker. When automatic reconnecting is required, the
-:class:`fedora_messaging.twisted.factory.FedoraMessagingFactory` class should
-be used to produce configured instances of :class:`.FedoraMessagingProtocol`.
+Twisted Service to start and stop the Fedora Messaging Twisted Factory.
 
-:class:`.FedoraMessagingProtocol` is based on pika's Twisted Protocol. It
-implements message schema validation when publishing and subscribing, as well
-as a few convenience methods for declaring multiple objects at once.
+This Service makes it easier to build a Twisted application that embeds a
+Fedora Messaging component. See the ``verify_missing`` service in
+fedmsg-migration-tools for a use case.
 
-For an overview of Twisted clients, see the `Twisted client documentation
-<https://twistedmatrix.com/documents/current/core/howto/clients.html#protocol>`_.
+See https://twistedmatrix.com/documents/current/core/howto/application.html
 """
 
-from __future__ import absolute_import
-
+from __future__ import absolute_import, unicode_literals
 from collections import namedtuple
+import locale
+import pkg_resources
 import uuid
 
-import pika
-import pkg_resources
 from pika.adapters.twisted_connection import TwistedProtocolConnection
-from twisted.internet import defer, error, threads, reactor
-
+from twisted.application import service
+from twisted.application.internet import TCPClient, SSLClient
+from twisted.internet import ssl, defer, protocol, error, threads, reactor
 from twisted.logger import Logger
+import pika
+import six
 
 from .. import config
+from .._session import _configure_tls_parameters
 from ..message import get_message
 from ..exceptions import (
     Nack,
@@ -63,6 +67,51 @@ else:
     ChannelClosedByClient = pika.exceptions.ChannelClosedByClient
 
 
+def _ssl_context_factory(parameters):
+    """
+    Produce a Twisted SSL context object from a pika connection parameter object.
+    This is necessary as Twisted manages the connection, not Pika.
+
+    Args:
+        parameters (pika.ConnectionParameters): The connection parameters built
+            from the fedora_messaging configuration.
+    """
+    client_cert = None
+    ca_cert = None
+    key = config.conf["tls"]["keyfile"]
+    cert = config.conf["tls"]["certfile"]
+    ca_file = config.conf["tls"]["ca_cert"]
+    if ca_file:
+        with open(ca_file, "rb") as fd:
+            # Open it in binary mode since otherwise Twisted will immediately
+            # re-encode it as ASCII, which won't work if the cert bundle has
+            # comments that can't be encoded with ASCII.
+            ca_cert = ssl.Certificate.loadPEM(fd.read())
+    if key and cert:
+        # Note that _configure_tls_parameters sets the auth mode to EXTERNAL
+        # if both key and cert are defined, so we don't need to do that here.
+        with open(key) as fd:
+            client_keypair = fd.read()
+        with open(cert) as fd:
+            client_keypair += fd.read()
+        client_cert = ssl.PrivateCertificate.loadPEM(client_keypair)
+
+    hostname = parameters.host
+    if not isinstance(hostname, six.text_type):
+        # Twisted requires the hostname as decoded text, which it isn't in Python 2
+        # Decode with the system encoding since this came from the config file. Die,
+        # Python 2, die.
+        hostname = hostname.decode(locale.getdefaultlocale()[1])
+    context_factory = ssl.optionsForClientTLS(
+        hostname,
+        trustRoot=ca_cert or ssl.platformTrust(),
+        clientCertificate=client_cert,
+        extraCertificateOptions={"raiseMinimumTo": ssl.TLSVersion.TLSv1_2},
+    )
+
+    return context_factory
+
+
 #: A namedtuple that represents a AMQP consumer.
 #:
 #: * The ``tag`` field is the consumer's AMQP tag (:class:`str`).
@@ -70,36 +119,231 @@ else:
 #: * The ``callback`` field is the function called for each message (a callable).
 #: * The ``channel`` is the AMQP channel used for the consumer
 #:   (:class:`pika.adapters.twisted_connection.TwistedChannel`).
-Consumer = namedtuple("Consumer", ["tag", "queue", "callback", "channel", "deferred"])
+Consumer = namedtuple("Consumer", ["tag", "queue", "callback", "channel"])
 
 
-class ConsumerV2(object):
+class Service(service.MultiService):
     """
-    Replace the namedtuple with this, we need to mutate running
+    A Twisted service that manages one or more client connections to an AMQP broker.
 
-    Attributes:
-        queue (str): The AMQP queue this consumer is subscribed to.
-        callback (callable): The callback to run when a message arrives.
-        result (defer.Deferred): A deferred that runs the callbacks if the
-            consumer exits gracefully by raising HaltConsumer or being canceled
-            and errbacks if an unhandled exception occurs in the callback, or if
-            HaltConsumer is raised with a non-zero exit code.
+    Args:
+        amqp_url (str): URL to use for the AMQP server.
     """
 
-    def __init__(self, queue=None, callback=None):
-        self.queue = queue
-        self.callback = callback
-        self.result = None
+    def __init__(self, amqp_url):
+        """Initialize the service."""
+        service.MultiService.__init__(self)
+        self._parameters = pika.URLParameters(amqp_url)
+        if amqp_url.startswith("amqps"):
+            _configure_tls_parameters(self._parameters)
+        if self._parameters.client_properties is None:
+            self._parameters.client_properties = config.conf["client_properties"]
 
-        # The current channel used by this consumer.
-        self._channel = None
-        # The unique ID for the AMQP consumer.
-        self._tag = str(uuid.uuid4())
-        # Used to start and stop the consumer via cancel(), pauseProducing()
-        self._running = True
+        self.factory = Factory(self._parameters)
+        self.connection = None
+        self.setName("AMQPServiceContainer")
+
+    def startService(self):
+        """
+        Start the service, and by extension all its child services.
+
+        This is part of the Twisted Service API.
+        """
+        # Get hold of the deferred from the protocol, register callback to exit
+        # on raise exception
+        if self._parameters.ssl_options:
+            self.connection = SSLClient(
+                host=self._parameters.host,
+                port=self._parameters.port,
+                factory=self.factory,
+                contextFactory=_ssl_context_factory(self._parameters),
+            )
+        else:
+            self.connection = TCPClient(
+                host=self._parameters.host,
+                port=self._parameters.port,
+                factory=self.factory,
+            )
+        name = "{}{}:{}".format(
+            "ssl:" if self._parameters.ssl_options else "",
+            self._parameters.host,
+            self._parameters.port,
+        )
+        self.connection.setName(name)
+        self.connection.setServiceParent(self)
+
+        service.MultiService.startService(self)
+
+    @defer.inlineCallbacks
+    def stopService(self):
+        """
+        Gracefully stop the service.
+
+        This is part of the Twisted Service API.
+
+        Returns:
+            defer.Deferred: a Deferred which is triggered when the service has
+                finished shutting down.
+        """
+        self.factory.stopTrying()
+        yield self.factory.stopFactory()
+        yield service.MultiService.stopService(self)
+
+    def consume(self, callback, bindings, queues):
+        """
+        Start a consumer that lasts across individual connections.
+
+        Args:
+            callback (callable): A callable object that accepts one positional argument,
+                a :class:`Message` or a class object that implements the ``__call__``
+                method. The class will be instantiated before use.
+            bindings (dict or list of dict): Bindings to declare before consuming. This
+                should be the same format as the :ref:`conf-bindings` configuration.
+            queue (dict): The queue to declare and consume from. This dictionary should
+                have the "queue", "durable", "auto_delete", "exclusive", and "arguments"
+                keys.
+
+        Returns:
+            Deferred:
+                A deferred object that fires with a representation of the consumer
+                when it is successfully registered and running. Note that this API
+                is meant to survive network problems, so consuming will continue
+                until a corresponding call to :func:`consume_async_cancel` is called.
+        """
+        return self.factory.consume(callback, bindings, queues)
 
 
-class FedoraMessagingProtocol(TwistedProtocolConnection):
+class Factory(protocol.ReconnectingClientFactory):
+    """
+    Reconnecting factory for the Fedora Messaging protocol.
+    """
+
+    def __init__(
+        self, parameters, confirms=True, exchanges=None, queues=None, bindings=None
+    ):
+        """
+        Create a new factory for protocol objects.
+
+        Any exchanges, queues, bindings, or consumers provided here will be
+        declared and set up each time a new protocol instance is created. In
+        other words, each time a new connection is set up to the broker, it
+        will start with the declaration of these objects.
+
+        Args:
+            parameters (pika.ConnectionParameters): The connection parameters.
+            confirms (bool): If true, attempt to turn on publish confirms extension.
+            exchanges (list of dicts): List of exchanges to declare. Each dictionary is
+                passed to :meth:`pika.channel.Channel.exchange_declare` as keyword arguments,
+                so any parameter to that method is a valid key.
+            queues (list of dicts): List of queues to declare each dictionary is
+                passed to :meth:`pika.channel.Channel.queue_declare` as keyword arguments,
+                so any parameter to that method is a valid key.
+            bindings (list of dicts): A list of bindings to be created between
+                queues and exchanges. Each dictionary is passed to
+                :meth:`pika.channel.Channel.queue_bind`. The "queue" and "exchange" keys
+                are required.
+        """
+        self.protocol = Protocol
+
+        self.confirms = confirms
+        self._parameters = parameters
+        self._client_deferred = defer.Deferred()
+        self._client = None
+        self._consumers = {}
+
+    @defer.inlineCallbacks
+    def consume(self, callback, bindings, queues):
+        """
+        Start a consumer that lasts across individual connections.
+
+        Args:
+            callback (callable): A callable object that accepts one positional argument,
+                a :class:`Message` or a class object that implements the ``__call__``
+                method. The class will be instantiated before use.
+            bindings (dict or list of dict): Bindings to declare before consuming. This
+                should be the same format as the :ref:`conf-bindings` configuration.
+            queue (dict): The queue to declare and consume from. This dictionary should
+                have the "queue", "durable", "auto_delete", "exclusive", and "arguments"
+                keys.
+
+        Returns:
+            Deferred:
+                A deferred object that fires with a representation of the consumer
+                when it is successfully registered and running. Note that this API
+                is meant to survive network problems, so consuming will continue
+                until a corresponding call to :func:`consume_async_cancel` is called.
+        """
+        expanded_bindings = []
+        for binding in bindings:
+            for key in binding["routing_keys"]:
+                b = binding.copy()
+                del b["routing_keys"]
+                b["routing_key"] = key
+                expanded_bindings.append(b)
+
+        expanded_queues = []
+        for name, settings in queues.items():
+            q = {"queue": name}
+            q.update(settings)
+            expanded_queues.append(q)
+
+        _log.info("Requesting connection")
+        protocol = yield defer.maybeDeferred(self.get_connection)
+        _log.info("Got connection")
+        yield protocol.declare_queues(expanded_queues)
+        yield protocol.bind_queues(expanded_bindings)
+
+        consumers = []
+        for queue in expanded_queues:
+            consumer = yield protocol.consume(callback, queue["queue"])
+            consumers.append(consumer)
+
+        defer.returnValue(consumers)
+
+    @defer.inlineCallbacks
+    def cancel(self, consumer):
+        del self._consumers[consumer["queue"]]
+        protocol = yield defer.maybeDeferred(self.get_connection)
+        yield protocol.cancel(consumer)
+
+    def get_connection(self):
+        if self._client and not self._client.is_closed:
+            return self._client
+        else:
+            return self._client_deferred
+        pass
+
+    def buildProtocol(self, addr):
+        """Create the Protocol instance.
+
+        See the documentation of
+        `twisted.internet.protocol.ReconnectingClientFactory` for details.
+        """
+        self._client = self.protocol(self._parameters, confirms=self.confirms)
+        self._client.factory = self
+
+        def on_ready(unused_param=None):
+            """Reset the connection delay when the AMQP handshake is complete."""
+            self.resetDelay()
+            self._client_deferred.callback(self._client)
+            self._client_deferred = defer.Deferred()
+
+        self._client.ready.addCallback(on_ready)
+        return self._client
+
+    @defer.inlineCallbacks
+    def stopFactory(self):
+        """Stop the factory.
+
+        See the documentation of
+        `twisted.internet.protocol.ReconnectingClientFactory` for details.
+        """
+        if self._client:
+            yield self._client.stopProducing()
+        protocol.ReconnectingClientFactory.stopFactory(self)
+
+
+class Protocol(TwistedProtocolConnection):
     """A Twisted Protocol for the Fedora Messaging system.
 
     This protocol builds on the generic pika AMQP protocol to add calls
@@ -213,10 +457,10 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
         consumer (dict): A dictionary describing the consumer for the given
             queue_object.
         """
-        while consumer._running:
+        while consumer["running"]:
             try:
                 deferred_get = queue_object.get()
-                deferred_get.addTimeout(1, reactor)
+                deferred_get.addTimeout(3, reactor)
                 channel, delivery_frame, properties, body = yield deferred_get
             except defer.TimeoutError:
                 continue
@@ -224,11 +468,11 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
             _log.debug(
                 "Message arrived with delivery tag {tag} for {consumer}",
                 tag=delivery_frame.delivery_tag,
-                consumer=consumer._tag,
+                consumer=consumer["tag"],
             )
             try:
                 message = get_message(delivery_frame.routing_key, properties, body)
-                message.queue = consumer.queue
+                message.queue = consumer["queue"]
             except ValidationError:
                 _log.warn(
                     "Message id {msgid} did not pass validation; ignoring message",
@@ -245,7 +489,7 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
                     topic=message.topic,
                     msgid=properties.message_id,
                 )
-                yield threads.deferToThread(consumer.callback, message)
+                yield threads.deferToThread(consumer["callback"], message)
             except Nack:
                 _log.warn(
                     "Returning message id {msgid} to the queue", msgid=properties.message_id
@@ -286,44 +530,6 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
                 yield channel.basic_ack(delivery_tag=delivery_frame.delivery_tag)
 
     @defer.inlineCallbacks
-    def publish(self, message, exchange):
-        """
-        Publish a :class:`fedora_messaging.message.Message` to an `exchange`_
-        on the message broker.
-
-        Args:
-            message (message.Message): The message to publish.
-            exchange (str): The name of the AMQP exchange to publish to
-
-        Raises:
-            NoFreeChannels: If there are no available channels on this connection.
-                If this occurs, you can either reduce the number of consumers on this
-                connection or create an additional connection.
-            PublishReturned: If the broker rejected the message. This can happen if
-                there are resource limits that have been reached (full disk, for example)
-                or if the message will be routed to 0 queues and the exchange is set to
-                reject such messages.
-
-        .. _exchange: https://www.rabbitmq.com/tutorials/amqp-concepts.html#exchanges
-        """
-        message.validate()
-        try:
-            yield self._channel.basic_publish(
-                exchange=exchange,
-                routing_key=message._encoded_routing_key,
-                body=message._encoded_body,
-                properties=message._properties,
-            )
-        except (pika.exceptions.NackError, pika.exceptions.UnroutableError) as e:
-            _log.error("Message was rejected by the broker ({reason})", reason=str(e))
-            raise PublishReturned(reason=e)
-        except pika.exceptions.ChannelClosed:
-            self._channel = yield self._allocate_channel()
-            yield self.publish(message, exchange)
-        except pika.exceptions.ConnectionClosed as e:
-            raise ConnectionException(reason=e)
-
-    @defer.inlineCallbacks
     def consume(self, callback, queue):
         """
         Register a message consumer that executes the provided callback when
@@ -350,37 +556,40 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
             If this occurs, you can either reduce the number of consumers on this
             connection or create an additional connection.
         """
-        if queue in self._consumers:
-            self._consumers[queue].callback = callback
-            return
-
-        consumer = ConsumerV2(queue=queue, callback=callback)
-        consumer._channel = yield self._allocate_channel()
-        queue_object, _ = yield consumer._channel.basic_consume(
-            queue=consumer.queue, consumer_tag=consumer._tag
+        channel = yield self._allocate_channel()
+        consumer = {
+            "tag": str(uuid.uuid4()),
+            "queue": queue,
+            "callback": callback,
+            "channel": channel,
+            "running": True,
+            "read_loop": None
+        }
+        queue_object, _ = yield channel.basic_consume(
+            queue=consumer["queue"], consumer_tag=consumer["tag"]
         )
-        consumer.result = self._read(queue_object, consumer)
+        consumer["read_loop"] = self._read(queue_object, consumer)
         self._consumers[queue] = consumer
         _log.info("Successfully registered AMQP consumer {c}", c=consumer)
         defer.returnValue(consumer)
 
     @defer.inlineCallbacks
     def cancel(self, consumer):
-        consumer._running = False
+        consumer["running"] = False
 
         # Wait for the last message to finish.
-        yield consumer.result
+        yield consumer["read_loop"]
 
-        del self._consumers[consumer.queue]
+        del self._consumers[consumer["queue"]]
 
         try:
-            yield consumer._channel.basic_cancel(consumer_tag=consumer._tag)
+            yield consumer["channel"].basic_cancel(consumer_tag=consumer["tag"])
         except pika.exceptions.AMQPChannelError:
             # Consumers are tied to channels, so if this channel is dead the
             # consumer should already be canceled (and we can't get to it anyway)
             pass
         try:
-            yield consumer._channel.close()
+            yield consumer["channel"].close()
         except pika.exceptions.AMQPChannelError:
             pass
 
@@ -514,16 +723,21 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
         Returns:
             defer.Deferred: fired when the production is ready to start
         """
+        # Start consuming
+        for consumer in self._consumers:
+            consumer["running"] = True
+
+        self._running = True
         for consumer in self._consumers.values():
-            consumer._running = True
-            queue_object, _ = yield consumer._channel.basic_consume(
-                queue=consumer.queue, consumer_tag=consumer._tag
+            queue_object, _ = yield consumer["channel"].basic_consume(
+                queue=consumer["queue"], consumer_tag=consumer["tag"]
             )
-            consumer.result = self._read(queue_object, consumer)
-            consumer.result.addErrback(
+            deferred = self._read(queue_object, consumer)
+            deferred.addErrback(
                 lambda f: _log.failure, "_read failed on consumer {c}", c=consumer
             )
-        _log.info("All AMQP consumers have successfully been started.")
+            consumer["read_loop"] = deferred
+        _log.info("AMQP connection successfully established")
 
     @defer.inlineCallbacks
     def pauseProducing(self):
@@ -538,18 +752,18 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
         """
         for c in self._consumers.values():
             _log.info("{c!r}", c=c)
-            c._running = False
-        read_loops = [c.result for c in self._consumers.values()]
+            c["running"] = False
+
+        read_loops = [c["read_loop"] for c in self._consumers.values()]
         _log.info(
             "Waiting for {n} consumer(s) to finish processing before canceling the consumer",
             n=len(read_loops)
         )
         yield defer.gatherResults(read_loops)
-
         for consumer in self._consumers.values():
-            yield consumer._channel.basic_cancel(consumer_tag=consumer._tag)
+            yield consumer["channel"].basic_cancel(consumer_tag=consumer["tag"])
             try:
-                yield consumer._channel.close()
+                yield consumer["channel"].close()
             except pika.exceptions.AMQPChannelError:
                 pass
         _log.info("{n} consumers canceled", n=len(self._consumers))
@@ -564,10 +778,9 @@ class FedoraMessagingProtocol(TwistedProtocolConnection):
         """
         _log.info("Starting to disconnect from the AMQP broker")
         if self.is_closed:
-            # We were asked to stop because the connection is already gone.
-            # There's no graceful way to stop because we can't acknowledge
-            # messages in the middle of being processed.
-
+            # We were asked to stop because the connection is being restarted.
+            # There's no graceful way to stop because we can't acknowledge messages
+            # in the middle of being processed.
             self._channel = None
             return
         yield self.pauseProducing()

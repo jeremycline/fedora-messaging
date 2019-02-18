@@ -18,6 +18,9 @@
 from __future__ import print_function
 
 import six
+import time
+
+from . import exceptions
 
 
 def printer(message):
@@ -30,3 +33,13 @@ def printer(message):
         message (fedora_messaging.api.Message): The message that was received.
     """
     print(six.text_type(message))
+
+
+def bad_consumer(message):
+    """ A consumer that misbehaves"""
+    time.sleep(30)
+    print(six.text_type(message))
+
+
+def exit(message):
+    raise exceptions.HaltConsumer(exit_code=0)
